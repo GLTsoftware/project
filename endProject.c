@@ -32,7 +32,7 @@
 #define RKEY_CURRENT_TIMESTAMP   "glt:project:current:timestamp"
 
 /* Permanent log */
-#define RKEY_PROJECT_LOG         "glt:project:log"
+#define RKEY_PROJECT_LOG_PREFIX  "glt:project:log:"
 
 #define STATUS_IDLE 0
 
@@ -73,16 +73,15 @@ int main(int argc, char **argv) {
         strncpy(project_code, reply->str, sizeof(project_code) - 1);
     if (reply) freeReplyObject(reply);
 
-    /* Log the project end event */
+    /* Record end time in the project's hash */
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
     char timestamp[32];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    char logentry[256];
-    snprintf(logentry, sizeof(logentry),
-             "%s | code=%s | PROJECT ENDED", timestamp, project_code);
-    reply = redisCommand(c, "LPUSH %s %s", RKEY_PROJECT_LOG, logentry);
+    char hashkey[96];
+    snprintf(hashkey, sizeof(hashkey), "%s%s", RKEY_PROJECT_LOG_PREFIX, project_code);
+    reply = redisCommand(c, "HSET %s end_timestamp %s", hashkey, timestamp);
     if (reply) freeReplyObject(reply);
 
     /* Clear all current display fields to blank strings */

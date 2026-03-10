@@ -49,8 +49,9 @@
 #define RKEY_CURRENT_CODE        "glt:project:current:code"
 #define RKEY_CURRENT_TIMESTAMP   "glt:project:current:timestamp"
 
-/* Permanent log (append-only list, newest entry at index 0) */
-#define RKEY_PROJECT_LOG         "glt:project:log"
+/* Permanent log: one hash per project, plus a sorted set index */
+#define RKEY_PROJECT_LOG_PREFIX  "glt:project:log:"
+#define RKEY_PROJECT_INDEX       "glt:project:index"
 
 /* Status codes */
 #define STATUS_LOCKOUT -1
@@ -150,8 +151,8 @@ static char *redis_get(redisContext *c, const char *key) {
 }
 
 /* Generate project code: YYYY_MM_DD_SEQ.
-   Reads the most recent log entry to determine the last sequence number.
-   If its date matches today, increments; otherwise starts at 1. */
+   Queries the sorted set index for the most recently created code.
+   If its date matches today, increments the sequence; otherwise starts at 1. */
 static void generate_project_code(redisContext *c, char *code, size_t len) {
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
@@ -161,30 +162,18 @@ static void generate_project_code(redisContext *c, char *code, size_t len) {
 
     int seq = 1;
 
-    /* Most recent log entry is at index 0 (LPUSH keeps newest first) */
-    redisReply *reply = redisCommand(c, "LINDEX %s 0", RKEY_PROJECT_LOG);
-    if (reply != NULL && reply->type == REDIS_REPLY_STRING && reply->str != NULL) {
-        /* Log format: "TIMESTAMP | code=YYYY_MM_DD_N | ..." */
-        char *cp = strstr(reply->str, "code=");
-        if (cp != NULL) {
-            cp += 5; /* skip "code=" */
-            char last_code[MAX_CODE_LEN];
-            int j = 0;
-            while (cp[j] && cp[j] != ' ' && cp[j] != '|' &&
-                   j < (int)(sizeof(last_code) - 1)) {
-                last_code[j] = cp[j];
-                j++;
-            }
-            last_code[j] = '\0';
-
-            if (strlen(last_code) >= 10 &&
-                strncmp(last_code, today, 10) == 0) {
-                char *last_underscore = strrchr(last_code, '_');
-                if (last_underscore != NULL) {
-                    int last_seq = atoi(last_underscore + 1);
-                    if (last_seq > 0)
-                        seq = last_seq + 1;
-                }
+    /* Highest score (most recent timestamp) is at index -1 with ZREVRANGE */
+    redisReply *reply = redisCommand(c, "ZREVRANGE %s 0 0", RKEY_PROJECT_INDEX);
+    if (reply != NULL && reply->type == REDIS_REPLY_ARRAY &&
+        reply->elements > 0 && reply->element[0]->str != NULL) {
+        const char *last_code = reply->element[0]->str;
+        if (strlen(last_code) >= 10 &&
+            strncmp(last_code, today, 10) == 0) {
+            const char *last_underscore = strrchr(last_code, '_');
+            if (last_underscore != NULL) {
+                int last_seq = atoi(last_underscore + 1);
+                if (last_seq > 0)
+                    seq = last_seq + 1;
             }
         }
     }
@@ -204,28 +193,60 @@ static int prompt_input(const char *prompt, char *buf, size_t buflen) {
     return 0;
 }
 
-/* Log the project event to the Redis list for historical record */
+/* Log the project event to Redis.
+ *
+ * Each project gets a hash at glt:project:log:<code> with all its fields.
+ * For new projects the hash is created and the code is added to the sorted
+ * set glt:project:index (scored by Unix timestamp) for ordered retrieval.
+ * For revisions the hash fields are updated and revised_timestamp is set.
+ */
 static void log_project(redisContext *c, const char *code,
                          const char *pi, const char *observer,
                          const char *location, const char *description,
                          const char *type, int receiver,
                          const char *comment, int status,
-                         const char *timestamp)
+                         const char *timestamp, time_t ts_epoch,
+                         int is_new)
 {
-    char logentry[2048];
-    snprintf(logentry, sizeof(logentry),
-             "%s | code=%s | pi=%s | observer=%s | location=%s | "
-             "type=%s | receiver=%d | status=%d | comment=%s | desc=%s",
-             timestamp, code, pi, observer, location,
-             type, receiver, status, comment, description);
+    char hashkey[64];
+    snprintf(hashkey, sizeof(hashkey), "%s%s", RKEY_PROJECT_LOG_PREFIX, code);
 
-    redisReply *reply = redisCommand(c, "LPUSH %s %s",
-                                     RKEY_PROJECT_LOG, logentry);
-    if (reply == NULL) {
-        fprintf(stderr, "Warning: failed to write project log entry\n");
-        return;
+    char receiver_str[16], status_str[16];
+    snprintf(receiver_str, sizeof(receiver_str), "%d", receiver);
+    snprintf(status_str,   sizeof(status_str),   "%d", status);
+
+    redisReply *reply;
+
+    if (is_new) {
+        reply = redisCommand(c,
+            "HSET %s start_timestamp %s pi %s observer %s location %s "
+            "description %s type %s receiver %s comment %s status %s",
+            hashkey, timestamp, pi, observer, location,
+            description, type, receiver_str, comment, status_str);
+        if (reply == NULL)
+            fprintf(stderr, "Warning: failed to write project hash\n");
+        else
+            freeReplyObject(reply);
+
+        /* Add to sorted set, scored by creation time */
+        reply = redisCommand(c, "ZADD %s %ld %s",
+                             RKEY_PROJECT_INDEX, (long)ts_epoch, code);
+        if (reply == NULL)
+            fprintf(stderr, "Warning: failed to update project index\n");
+        else
+            freeReplyObject(reply);
+    } else {
+        /* Revise: update all fields and record revision timestamp */
+        reply = redisCommand(c,
+            "HSET %s revised_timestamp %s pi %s observer %s location %s "
+            "description %s type %s receiver %s comment %s status %s",
+            hashkey, timestamp, pi, observer, location,
+            description, type, receiver_str, comment, status_str);
+        if (reply == NULL)
+            fprintf(stderr, "Warning: failed to update project hash\n");
+        else
+            freeReplyObject(reply);
     }
-    freeReplyObject(reply);
 }
 
 int main(int argc, char **argv) {
@@ -537,10 +558,10 @@ int main(int argc, char **argv) {
         if (v) free(v);
     }
 
-    /* Append timestamped log entry */
+    /* Write to permanent log (hash + sorted set index) */
     log_project(c, project_code, log_pi, log_observer, log_location,
                 log_description, log_type, log_receiver, log_comment,
-                status, timestamp);
+                status, timestamp, now, !reviseFlag);
 
     /* Print summary */
     printf("Project %s:\n", reviseFlag ? "revised" : "created");
