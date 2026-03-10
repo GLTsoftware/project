@@ -171,8 +171,10 @@ static void generate_project_code(redisContext *c, char *code, size_t len) {
             char last_code[MAX_CODE_LEN];
             int j = 0;
             while (cp[j] && cp[j] != ' ' && cp[j] != '|' &&
-                   j < (int)(sizeof(last_code) - 1))
-                last_code[j] = cp[j++];
+                   j < (int)(sizeof(last_code) - 1)) {
+                last_code[j] = cp[j];
+                j++;
+            }
             last_code[j] = '\0';
 
             if (strlen(last_code) >= 10 &&
