@@ -3,9 +3,8 @@
  * endProject.c
  *
  * GLT command to end the current observing project.
- * Sets the project status to idle (0) and writes a log entry.
- * All project info keys are left intact in Redis; gltmonitor
- * uses the status key to decide whether to display them.
+ * Clears the current display variables (glt:project:current:*)
+ * and sets status to idle (0).  The permanent log is untouched.
  *
  * NAP, March 2026
  *
@@ -20,9 +19,19 @@
 #define REDIS_SERVER "192.168.1.141"
 #define REDIS_PORT   6379
 
-/* Redis keys (must match project.c) */
-#define RKEY_PROJECT_STATUS      "glt:project:status"
-#define RKEY_PROJECT_CODE        "glt:project:code"
+/* Current display keys (must match project.c) */
+#define RKEY_CURRENT_PI          "glt:project:current:pi"
+#define RKEY_CURRENT_OBSERVER    "glt:project:current:observer"
+#define RKEY_CURRENT_LOCATION    "glt:project:current:location"
+#define RKEY_CURRENT_DESCRIPTION "glt:project:current:description"
+#define RKEY_CURRENT_TYPE        "glt:project:current:type"
+#define RKEY_CURRENT_RECEIVER    "glt:project:current:receiver"
+#define RKEY_CURRENT_COMMENT     "glt:project:current:comment"
+#define RKEY_CURRENT_STATUS      "glt:project:current:status"
+#define RKEY_CURRENT_CODE        "glt:project:current:code"
+#define RKEY_CURRENT_TIMESTAMP   "glt:project:current:timestamp"
+
+/* Permanent log */
 #define RKEY_PROJECT_LOG         "glt:project:log"
 
 #define STATUS_IDLE 0
@@ -41,7 +50,7 @@ int main(int argc, char **argv) {
     }
 
     /* Check if there is an active project */
-    redisReply *reply = redisCommand(c, "GET %s", RKEY_PROJECT_STATUS);
+    redisReply *reply = redisCommand(c, "GET %s", RKEY_CURRENT_STATUS);
     if (reply != NULL && reply->type == REDIS_REPLY_STRING) {
         int status = atoi(reply->str);
         freeReplyObject(reply);
@@ -59,7 +68,7 @@ int main(int argc, char **argv) {
 
     /* Read current project code for the log entry */
     char project_code[64] = "";
-    reply = redisCommand(c, "GET %s", RKEY_PROJECT_CODE);
+    reply = redisCommand(c, "GET %s", RKEY_CURRENT_CODE);
     if (reply != NULL && reply->type == REDIS_REPLY_STRING && reply->str)
         strncpy(project_code, reply->str, sizeof(project_code) - 1);
     if (reply) freeReplyObject(reply);
@@ -76,13 +85,34 @@ int main(int argc, char **argv) {
     reply = redisCommand(c, "LPUSH %s %s", RKEY_PROJECT_LOG, logentry);
     if (reply) freeReplyObject(reply);
 
-    /* Set status to idle */
-    reply = redisCommand(c, "SET %s %d", RKEY_PROJECT_STATUS, STATUS_IDLE);
-    if (reply == NULL) {
-        fprintf(stderr, "Warning: failed to set status to idle\n");
-    } else {
-        freeReplyObject(reply);
+    /* Clear all current display fields to blank strings */
+    const char *keys_to_clear[] = {
+        RKEY_CURRENT_PI,
+        RKEY_CURRENT_OBSERVER,
+        RKEY_CURRENT_LOCATION,
+        RKEY_CURRENT_DESCRIPTION,
+        RKEY_CURRENT_TYPE,
+        RKEY_CURRENT_RECEIVER,
+        RKEY_CURRENT_COMMENT,
+        RKEY_CURRENT_CODE,
+        RKEY_CURRENT_TIMESTAMP,
+        NULL
+    };
+
+    for (int i = 0; keys_to_clear[i] != NULL; i++) {
+        reply = redisCommand(c, "SET %s %s", keys_to_clear[i], "");
+        if (reply == NULL)
+            fprintf(stderr, "Warning: failed to clear %s\n", keys_to_clear[i]);
+        else
+            freeReplyObject(reply);
     }
+
+    /* Set status to idle */
+    reply = redisCommand(c, "SET %s %d", RKEY_CURRENT_STATUS, STATUS_IDLE);
+    if (reply == NULL)
+        fprintf(stderr, "Warning: failed to set status to idle\n");
+    else
+        freeReplyObject(reply);
 
     printf("Project %s ended at %s. Status set to idle.\n",
            project_code, timestamp);

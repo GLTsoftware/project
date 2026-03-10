@@ -3,11 +3,16 @@
  * project.c
  *
  * GLT command for creating/revising an observing project definition.
- * Project info is stored in Redis for display by gltmonitor and
- * for historical log-keeping.
  *
- * Simplified from the SMA version (no receiver/IF/LO/correlator
- * setup -- only project metadata management).
+ * Two Redis namespaces are used:
+ *
+ *   glt:project:log          - permanent append-only list of all project
+ *                              start/revise events (for history and for
+ *                              deriving the next sequence number).
+ *
+ *   glt:project:current:*   - current display variables read by gltmonitor.
+ *                              Written here on project start/revise;
+ *                              cleared by endProject.
  *
  * NAP, March 2026
  *
@@ -32,17 +37,19 @@
 #define MAX_COMMENT_LEN    256
 #define MAX_CODE_LEN        32
 
-/* Redis keys */
-#define RKEY_PROJECT_PI          "glt:project:pi"
-#define RKEY_PROJECT_OBSERVER    "glt:project:observer"
-#define RKEY_PROJECT_LOCATION    "glt:project:location"
-#define RKEY_PROJECT_DESCRIPTION "glt:project:description"
-#define RKEY_PROJECT_TYPE        "glt:project:type"
-#define RKEY_PROJECT_RECEIVER    "glt:project:receiver"
-#define RKEY_PROJECT_COMMENT     "glt:project:comment"
-#define RKEY_PROJECT_STATUS      "glt:project:status"
-#define RKEY_PROJECT_CODE        "glt:project:code"
-#define RKEY_PROJECT_TIMESTAMP   "glt:project:timestamp"
+/* Current display keys (read by gltmonitor, cleared by endProject) */
+#define RKEY_CURRENT_PI          "glt:project:current:pi"
+#define RKEY_CURRENT_OBSERVER    "glt:project:current:observer"
+#define RKEY_CURRENT_LOCATION    "glt:project:current:location"
+#define RKEY_CURRENT_DESCRIPTION "glt:project:current:description"
+#define RKEY_CURRENT_TYPE        "glt:project:current:type"
+#define RKEY_CURRENT_RECEIVER    "glt:project:current:receiver"
+#define RKEY_CURRENT_COMMENT     "glt:project:current:comment"
+#define RKEY_CURRENT_STATUS      "glt:project:current:status"
+#define RKEY_CURRENT_CODE        "glt:project:current:code"
+#define RKEY_CURRENT_TIMESTAMP   "glt:project:current:timestamp"
+
+/* Permanent log (append-only list, newest entry at index 0) */
 #define RKEY_PROJECT_LOG         "glt:project:log"
 
 /* Status codes */
@@ -130,7 +137,7 @@ static int redis_set(redisContext *c, const char *key, const char *value) {
 }
 
 /* Helper: GET a redis string key; caller must free returned string (strdup'd).
-   Returns NULL if key does not exist. */
+   Returns NULL if key does not exist or is empty. */
 static char *redis_get(redisContext *c, const char *key) {
     redisReply *reply = redisCommand(c, "GET %s", key);
     if (reply == NULL)
@@ -143,8 +150,8 @@ static char *redis_get(redisContext *c, const char *key) {
 }
 
 /* Generate project code: YYYY_MM_DD_SEQ.
-   Reads the last project code from Redis to determine the sequence number.
-   If the date matches today, increments; otherwise starts at 1. */
+   Reads the most recent log entry to determine the last sequence number.
+   If its date matches today, increments; otherwise starts at 1. */
 static void generate_project_code(redisContext *c, char *code, size_t len) {
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
@@ -153,20 +160,33 @@ static void generate_project_code(redisContext *c, char *code, size_t len) {
              tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
 
     int seq = 1;
-    char *last_code = redis_get(c, RKEY_PROJECT_CODE);
-    if (last_code != NULL && strlen(last_code) >= 10) {
-        /* Check if the date portion matches today */
-        if (strncmp(last_code, today, 10) == 0) {
-            /* Extract the sequence number after the last underscore */
-            char *last_underscore = strrchr(last_code, '_');
-            if (last_underscore != NULL) {
-                int last_seq = atoi(last_underscore + 1);
-                if (last_seq > 0)
-                    seq = last_seq + 1;
+
+    /* Most recent log entry is at index 0 (LPUSH keeps newest first) */
+    redisReply *reply = redisCommand(c, "LINDEX %s 0", RKEY_PROJECT_LOG);
+    if (reply != NULL && reply->type == REDIS_REPLY_STRING && reply->str != NULL) {
+        /* Log format: "TIMESTAMP | code=YYYY_MM_DD_N | ..." */
+        char *cp = strstr(reply->str, "code=");
+        if (cp != NULL) {
+            cp += 5; /* skip "code=" */
+            char last_code[MAX_CODE_LEN];
+            int j = 0;
+            while (cp[j] && cp[j] != ' ' && cp[j] != '|' &&
+                   j < (int)(sizeof(last_code) - 1))
+                last_code[j] = cp[j++];
+            last_code[j] = '\0';
+
+            if (strlen(last_code) >= 10 &&
+                strncmp(last_code, today, 10) == 0) {
+                char *last_underscore = strrchr(last_code, '_');
+                if (last_underscore != NULL) {
+                    int last_seq = atoi(last_underscore + 1);
+                    if (last_seq > 0)
+                        seq = last_seq + 1;
+                }
             }
         }
-        free(last_code);
     }
+    if (reply) freeReplyObject(reply);
 
     snprintf(code, len, "%s_%d", today, seq);
 }
@@ -182,7 +202,7 @@ static int prompt_input(const char *prompt, char *buf, size_t buflen) {
     return 0;
 }
 
-/* Log the project entry to the Redis list for historical record */
+/* Log the project event to the Redis list for historical record */
 static void log_project(redisContext *c, const char *code,
                          const char *pi, const char *observer,
                          const char *location, const char *description,
@@ -370,7 +390,7 @@ int main(int argc, char **argv) {
 
     /* Check for existing active project */
     if (!reviseFlag) {
-        char *current_status = redis_get(c, RKEY_PROJECT_STATUS);
+        char *current_status = redis_get(c, RKEY_CURRENT_STATUS);
         if (current_status != NULL) {
             int st = atoi(current_status);
             free(current_status);
@@ -386,7 +406,7 @@ int main(int argc, char **argv) {
 
     /* If revising, verify a project actually exists */
     if (reviseFlag) {
-        char *current_code = redis_get(c, RKEY_PROJECT_CODE);
+        char *current_code = redis_get(c, RKEY_CURRENT_CODE);
         if (current_code == NULL || strlen(current_code) == 0) {
             fprintf(stderr,
                 "Error: no existing project to revise. "
@@ -404,13 +424,13 @@ int main(int argc, char **argv) {
     char timestamp[32];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    /* For a new project, generate project code */
+    /* For a new project, generate project code from log history */
     char project_code[MAX_CODE_LEN];
     if (!reviseFlag) {
         generate_project_code(c, project_code, sizeof(project_code));
     } else {
         /* Keep existing project code for revision */
-        char *existing_code = redis_get(c, RKEY_PROJECT_CODE);
+        char *existing_code = redis_get(c, RKEY_CURRENT_CODE);
         if (existing_code) {
             strncpy(project_code, existing_code, MAX_CODE_LEN - 1);
             project_code[MAX_CODE_LEN - 1] = '\0';
@@ -423,39 +443,38 @@ int main(int argc, char **argv) {
     if (typeFlag) {
         status = status_from_type(type);
     } else if (reviseFlag) {
-        /* Keep existing status if type not being changed */
-        char *existing_status = redis_get(c, RKEY_PROJECT_STATUS);
+        char *existing_status = redis_get(c, RKEY_CURRENT_STATUS);
         status = existing_status ? atoi(existing_status) : STATUS_ACTIVE;
         if (existing_status) free(existing_status);
     } else {
         status = STATUS_ACTIVE;
     }
 
-    /* Write fields to Redis */
+    /* Write fields to current display keys */
     char numbuf[16];
 
     if (piFlag)
-        redis_set(c, RKEY_PROJECT_PI, pi);
+        redis_set(c, RKEY_CURRENT_PI, pi);
     if (observerFlag)
-        redis_set(c, RKEY_PROJECT_OBSERVER, observer);
+        redis_set(c, RKEY_CURRENT_OBSERVER, observer);
     if (locationFlag)
-        redis_set(c, RKEY_PROJECT_LOCATION, location);
+        redis_set(c, RKEY_CURRENT_LOCATION, location);
     if (descriptionFlag)
-        redis_set(c, RKEY_PROJECT_DESCRIPTION, description);
+        redis_set(c, RKEY_CURRENT_DESCRIPTION, description);
     if (typeFlag)
-        redis_set(c, RKEY_PROJECT_TYPE, type);
+        redis_set(c, RKEY_CURRENT_TYPE, type);
     if (receiverFlag) {
         snprintf(numbuf, sizeof(numbuf), "%d", receiver);
-        redis_set(c, RKEY_PROJECT_RECEIVER, numbuf);
+        redis_set(c, RKEY_CURRENT_RECEIVER, numbuf);
     }
     if (commentFlag)
-        redis_set(c, RKEY_PROJECT_COMMENT, comment);
+        redis_set(c, RKEY_CURRENT_COMMENT, comment);
 
-    /* Always write status, code, and timestamp */
+    /* Always write status, code, and timestamp to current keys */
     snprintf(numbuf, sizeof(numbuf), "%d", status);
-    redis_set(c, RKEY_PROJECT_STATUS, numbuf);
-    redis_set(c, RKEY_PROJECT_CODE, project_code);
-    redis_set(c, RKEY_PROJECT_TIMESTAMP, timestamp);
+    redis_set(c, RKEY_CURRENT_STATUS, numbuf);
+    redis_set(c, RKEY_CURRENT_CODE, project_code);
+    redis_set(c, RKEY_CURRENT_TIMESTAMP, timestamp);
 
     /*
      * For the log entry, read back any fields not given on this invocation
@@ -469,61 +488,60 @@ int main(int argc, char **argv) {
     if (piFlag) {
         strncpy(log_pi, pi, MAX_PI_LEN);
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_PI);
+        char *v = redis_get(c, RKEY_CURRENT_PI);
         strncpy(log_pi, v ? v : "", MAX_PI_LEN);
         if (v) free(v);
     }
     if (observerFlag) {
         strncpy(log_observer, observer, MAX_OBSERVER_LEN);
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_OBSERVER);
+        char *v = redis_get(c, RKEY_CURRENT_OBSERVER);
         strncpy(log_observer, v ? v : "", MAX_OBSERVER_LEN);
         if (v) free(v);
     }
     if (locationFlag) {
         strncpy(log_location, location, MAX_LOCATION_LEN);
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_LOCATION);
+        char *v = redis_get(c, RKEY_CURRENT_LOCATION);
         strncpy(log_location, v ? v : "", MAX_LOCATION_LEN);
         if (v) free(v);
     }
     if (descriptionFlag) {
         strncpy(log_description, description, MAX_DESC_LEN);
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_DESCRIPTION);
+        char *v = redis_get(c, RKEY_CURRENT_DESCRIPTION);
         strncpy(log_description, v ? v : "", MAX_DESC_LEN);
         if (v) free(v);
     }
     if (typeFlag) {
         strncpy(log_type, type, MAX_TYPE_LEN);
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_TYPE);
+        char *v = redis_get(c, RKEY_CURRENT_TYPE);
         strncpy(log_type, v ? v : "", MAX_TYPE_LEN);
         if (v) free(v);
     }
     if (receiverFlag) {
         log_receiver = receiver;
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_RECEIVER);
+        char *v = redis_get(c, RKEY_CURRENT_RECEIVER);
         log_receiver = v ? atoi(v) : 0;
         if (v) free(v);
     }
     if (commentFlag) {
         strncpy(log_comment, comment, MAX_COMMENT_LEN);
     } else {
-        char *v = redis_get(c, RKEY_PROJECT_COMMENT);
+        char *v = redis_get(c, RKEY_CURRENT_COMMENT);
         strncpy(log_comment, v ? v : "", MAX_COMMENT_LEN);
         if (v) free(v);
     }
 
-    /* Write timestamped log entry */
+    /* Append timestamped log entry */
     log_project(c, project_code, log_pi, log_observer, log_location,
                 log_description, log_type, log_receiver, log_comment,
                 status, timestamp);
 
     /* Print summary */
-    printf("Project %s%s:\n", reviseFlag ? "revised" : "created",
-           reviseFlag ? "" : "");
+    printf("Project %s:\n", reviseFlag ? "revised" : "created");
     printf("  Code:        %s\n", project_code);
     printf("  PI:          %s\n", log_pi);
     printf("  Observer:    %s\n", log_observer);
