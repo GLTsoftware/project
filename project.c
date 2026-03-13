@@ -29,6 +29,9 @@
 #define REDIS_SERVER "192.168.1.141"
 #define REDIS_PORT   6379
 
+/* Expiration time for project log hashes: 1 year in seconds */
+#define PROJECT_LOG_EXPIRY_SECONDS (365 * 24 * 60 * 60)
+
 #define MAX_PI_LEN          64
 #define MAX_OBSERVER_LEN    64
 #define MAX_LOCATION_LEN   128
@@ -228,6 +231,13 @@ static void log_project(redisContext *c, const char *code,
         else
             freeReplyObject(reply);
 
+        /* Set expiration on the project hash (1 year) */
+        reply = redisCommand(c, "EXPIRE %s %d", hashkey, PROJECT_LOG_EXPIRY_SECONDS);
+        if (reply == NULL)
+            fprintf(stderr, "Warning: failed to set expiration on project hash\n");
+        else
+            freeReplyObject(reply);
+
         /* Add to sorted set, scored by creation time */
         reply = redisCommand(c, "ZADD %s %ld %s",
                              RKEY_PROJECT_INDEX, (long)ts_epoch, code);
@@ -244,6 +254,13 @@ static void log_project(redisContext *c, const char *code,
             description, type, receiver_str, comment, status_str);
         if (reply == NULL)
             fprintf(stderr, "Warning: failed to update project hash\n");
+        else
+            freeReplyObject(reply);
+
+        /* Refresh expiration on the project hash (1 year from now) */
+        reply = redisCommand(c, "EXPIRE %s %d", hashkey, PROJECT_LOG_EXPIRY_SECONDS);
+        if (reply == NULL)
+            fprintf(stderr, "Warning: failed to refresh expiration on project hash\n");
         else
             freeReplyObject(reply);
     }

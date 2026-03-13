@@ -19,6 +19,9 @@
 #define REDIS_SERVER "192.168.1.141"
 #define REDIS_PORT   6379
 
+/* Expiration time for project log hashes: 1 year in seconds */
+#define PROJECT_LOG_EXPIRY_SECONDS (365 * 24 * 60 * 60)
+
 /* Current display keys (must match project.c) */
 #define RKEY_CURRENT_PI          "glt:project:current:pi"
 #define RKEY_CURRENT_OBSERVER    "glt:project:current:observer"
@@ -83,6 +86,13 @@ int main(int argc, char **argv) {
     snprintf(hashkey, sizeof(hashkey), "%s%s", RKEY_PROJECT_LOG_PREFIX, project_code);
     reply = redisCommand(c, "HSET %s end_timestamp %s", hashkey, timestamp);
     if (reply) freeReplyObject(reply);
+
+    /* Refresh expiration on the project hash (1 year from now) */
+    reply = redisCommand(c, "EXPIRE %s %d", hashkey, PROJECT_LOG_EXPIRY_SECONDS);
+    if (reply == NULL)
+        fprintf(stderr, "Warning: failed to refresh expiration on project hash\n");
+    else
+        freeReplyObject(reply);
 
     /* Clear all current display fields to blank strings */
     const char *keys_to_clear[] = {
